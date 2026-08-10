@@ -166,6 +166,13 @@ DOCX is where mixed Hebrew/English breaks most often, and Microsoft Word's bidi 
 3. **Flag `<w:rtl/>` ONLY on Hebrew runs of a paragraph that has no Latin letters** (a pure-Hebrew label or heading, digits allowed). There the flag is what anchors a trailing colon (`מחלות רקע:`) to the left end. A leading section-number marker (`2.`, `10.`) is additionally merged into the Hebrew run (`_merge_list_marker`) so its period does not flip to `.2`; a date like `13/01/2026` is left as its own LTR run so Word does not reverse it. The split stays by script so each run still gets the right complex-script font.
 4. Every run sets the complex-script font (`w:cs`) and size (`w:szCs`). Hebrew is a "complex script" in Word's model, so `w:ascii`/`w:sz` alone never govern the Hebrew glyphs. Omitting `w:cs`/`w:szCs` is the most common cause of "the font/size I set did nothing and the Hebrew looks broken". Bold and italic are the same: `w:b`/`w:i` only affect Latin, you also need `w:bCs`/`w:iCs`. **Never insert Unicode directional isolates (U+2066-2069) or marks to force order, Word renders them as visible `.notdef` boxes in the David font even though other viewers hide them.**
 
+**Anti-pattern: never hand-roll a paragraph's `pPr`/alignment outside `add_rtl_paragraph`.** Two real bugs, both from bypassing the helper for "just this one paragraph":
+
+- A centered title-page paragraph (`doc.add_paragraph()` + `WD_ALIGN_PARAGRAPH.CENTER`) built by hand, with `<w:bidi/>` never added. A short centered line can still *look* plausible in a lenient renderer even with the wrong base direction — the paragraph has no visible left/right skew to give it away — so this slips past a visual check. It only matters once the line is genuinely mixed (an English product name inside a Hebrew subtitle), where Word needs `<w:bidi/>` to bidi-order it correctly.
+- A references/citation list built by hand with `<w:bidi/>` and `WD_ALIGN_PARAGRAPH.RIGHT` hardcoded on every line regardless of content, instead of going through the helper's `_para_is_rtl` check. Every line was pure English (e.g. a reference title), which by rule 1 should get LTR base + left alignment — hardcoding RTL formatting on them directly contradicts rule 1 for every single line in that list.
+
+Both are easy to avoid: route **every** paragraph in the document through `add_rtl_paragraph` (or an equivalent that runs the same `_para_is_rtl` check), including one-off paragraphs like titles, TOC headings, and reference lists that don't feel like "real" RTL content. If a paragraph doesn't go through the helper, there is no automatic reminder to add `<w:bidi/>`, and it is easy to assume alignment alone is enough — it is not, per rule 1 above.
+
 ```python
 import re
 from docx import Document
@@ -386,6 +393,140 @@ add_rtl_table(doc,
 
 You still write headers/rows in natural left-to-right logical order in your Python list; `bidiVisual` only changes how Word *displays* them. **Do NOT try to "fix" a reversed table by reversing your column list in Python**, that double-reverses once `bidiVisual` is set and scrambles mixed LTR cells. Set `table_direction = RTL` and keep your data in logical order. For an **invoice totals block** (סכום ביניים / מע"מ / סה"כ לתשלום) the label cell usually spans the description columns via a horizontal merge (`row.cells[a].merge(row.cells[b])`); a merged span can mirror to the wrong side under `bidiVisual`, so verify the merged totals row in Word specifically. As with all DOCX work, verify in Word itself, not LibreOffice or Preview, which mirror tables more forgivingly and hide the bug.
 
+### RTL-correct numbered lists (bullets and multilevel headings) in DOCX
+
+**Do not use python-docx's built-in `'List Bullet'` (or `'List Number'`) paragraph style for a Hebrew document.** Its numbering definition — inherited from the default template python-docx ships with — hardcodes a **physical left-side** hanging indent with no RTL counterpart:
+
+```xml
+<w:abstractNum w:abstractNumId="1">
+  <w:lvl w:ilvl="0">
+    <w:lvlJc w:val="left"/>
+    <w:ind w:left="1440" w:hanging="360"/>
+  </w:lvl>
+</w:abstractNum>
+```
+
+Setting `<w:bidi/>` on the *paragraph* (as rule 1 requires) does nothing about this — the bullet/number's actual position comes from this separate numbering definition, which stays LTR regardless. **LibreOffice and Chromium both auto-mirror this for display**, so it can look correct in every renderer you're likely to check by hand — this is exactly the kind of Word-only bug the "always verify in Word itself" warning at the top of Step 5 is about. It surfaces the moment someone applies a genuine RTL fix in an editor that actually respects the stored indent, or opens the file in real Word: the bullet jumps to the wrong margin because the *stored* value was never mirrored, only its *display* was being forgiven.
+
+The fix is a **custom** `abstractNum`/`num` pair with RTL-mirrored geometry, referenced via `<w:numPr>` on each paragraph — not a hand-typed `•` character (that "fixes" the visual bug but throws away the semantic list: it's no longer editable via Word's list tools, and it's invisible to Word's outline view and to screen readers, which is worse for a document meant to be maintained, not just read once):
+
+```python
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+
+def add_rtl_bullet_numbering(doc):
+    """Register a custom bullet numbering definition with RTL-mirrored
+    indentation, and return its numId. Do this once per document."""
+    numbering_part = doc.part.numbering_part
+    numbering_elem = numbering_part.element
+
+    # Pick an abstractNumId/numId that doesn't collide with the template's
+    # existing built-in definitions (which start low, e.g. 0-10).
+    abstract_id = 100
+    num_id = 100
+
+    abstractNum = OxmlElement('w:abstractNum')
+    abstractNum.set(qn('w:abstractNumId'), str(abstract_id))
+    lvl = OxmlElement('w:lvl')
+    lvl.set(qn('w:ilvl'), '0')
+
+    start = OxmlElement('w:start'); start.set(qn('w:val'), '1')
+    numFmt = OxmlElement('w:numFmt'); numFmt.set(qn('w:val'), 'bullet')
+    lvlText = OxmlElement('w:lvlText'); lvlText.set(qn('w:val'), '•')
+    lvlJc = OxmlElement('w:lvlJc'); lvlJc.set(qn('w:val'), 'right')  # mirror of 'left'
+
+    pPr = OxmlElement('w:pPr')
+    pPr.append(OxmlElement('w:bidi'))  # level default is RTL base
+    ind = OxmlElement('w:ind')
+    ind.set(qn('w:right'), '432')      # mirror of w:left on the built-in style
+    ind.set(qn('w:hanging'), '288')    # bullet hangs further right than the text
+    pPr.append(ind)
+
+    rPr = OxmlElement('w:rPr')
+    rFonts = OxmlElement('w:rFonts')
+    rFonts.set(qn('w:ascii'), 'Arial'); rFonts.set(qn('w:hAnsi'), 'Arial'); rFonts.set(qn('w:cs'), 'Arial')
+    rPr.append(rFonts)
+
+    for el in (start, numFmt, lvlText, lvlJc, pPr, rPr):
+        lvl.append(el)
+    abstractNum.append(lvl)
+
+    num = OxmlElement('w:num')
+    num.set(qn('w:numId'), str(num_id))
+    abstractNumId_ref = OxmlElement('w:abstractNumId')
+    abstractNumId_ref.set(qn('w:val'), str(abstract_id))
+    num.append(abstractNumId_ref)
+
+    numbering_elem.append(abstractNum)
+    numbering_elem.append(num)
+    return num_id
+
+def add_rtl_bullet(doc, num_id, text, font='Arial', size=11, bold_prefix=None):
+    """Real numPr-backed bullet (not a typed '•' run) with RTL-mirrored geometry."""
+    p = doc.add_paragraph()
+    pPr = p._p.get_or_add_pPr()
+    pPr.append(pPr.makeelement(qn('w:bidi'), {}))
+    numPr = OxmlElement('w:numPr')
+    ilvl = OxmlElement('w:ilvl'); ilvl.set(qn('w:val'), '0')
+    numIdEl = OxmlElement('w:numId'); numIdEl.set(qn('w:val'), str(num_id))
+    numPr.append(ilvl); numPr.append(numIdEl)
+    pPr.append(numPr)
+    # Leave alignment UNSET — same reasoning as table cells below: the
+    # paragraph's visual position is governed by the numbering definition's
+    # own indent, a separate positioning subsystem from body-text w:jc. An
+    # explicit physical RIGHT here is the one place proven (via the table-cell
+    # bug) to fight a subsystem-driven mirror; leaving it unset lets <w:bidi/>
+    # + the numbering's own right-indent place it correctly.
+    if bold_prefix:
+        _add_runs(p, bold_prefix, font=font, size=size, bold=True)
+        _add_runs(p, text, font=font, size=size)
+    else:
+        _add_runs(p, text, font=font, size=size)
+    return p
+```
+
+The same hardcoded-LTR problem exists for **heading auto-numbering**: if you link a multilevel numbering definition to `Heading1`/`Heading2` via `<w:pStyle>` (Word's native "numbered headings" feature) instead of typing `"1. "` / `"2.1 "` literally into the heading text, that numbering definition needs the identical RTL treatment (`w:ind w:right=...`, `<w:bidi/>` in the level's `pPr`) — copy the `abstractNum`/`w:lvl` pattern above, adding one `<w:lvl>` per heading depth with `<w:pStyle w:val="Heading1"/>` (or `Heading2`, etc.) inside each level and `%1.` / `%1.%2.` `lvlText` patterns for the numbering format.
+
+### Cross-reference fields for numbered-section citations
+
+Once headings use real auto-numbering (rather than typed text), any inline citation of a section number in body text — "see section 5.2", or the Hebrew equivalent `(§5.2)` — needs to be a **field**, not typed text, or it silently goes stale the moment a section is added/removed/reordered.
+
+1. **Bookmark each heading paragraph:**
+
+```python
+def bookmark_paragraph(paragraph, name, bookmark_id):
+    start = OxmlElement('w:bookmarkStart')
+    start.set(qn('w:id'), str(bookmark_id))
+    start.set(qn('w:name'), name)
+    end = OxmlElement('w:bookmarkEnd')
+    end.set(qn('w:id'), str(bookmark_id))
+    paragraph._p.insert(0, start)
+    paragraph._p.append(end)
+```
+
+2. **Reference it with a `REF` field** (`\r` = number only, `\h` = make it a clickable hyperlink) instead of typing the section number:
+
+```python
+def add_ref_field(paragraph, bookmark_name):
+    run = paragraph.add_run()
+    for tag, text in [('begin', None), ('instr', f' REF {bookmark_name} \\r \\h '), ('separate', None), ('text', '…'), ('end', None)]:
+        r = paragraph.add_run()._r if tag != 'begin' else run._r
+        if tag == 'begin':
+            fld = OxmlElement('w:fldChar'); fld.set(qn('w:fldCharType'), 'begin'); r.append(fld)
+        elif tag == 'instr':
+            instr = OxmlElement('w:instrText'); instr.set(qn('xml:space'), 'preserve'); instr.text = text; r.append(instr)
+        elif tag == 'separate':
+            fld = OxmlElement('w:fldChar'); fld.set(qn('w:fldCharType'), 'separate'); r.append(fld)
+        elif tag == 'text':
+            t = OxmlElement('w:t'); t.text = text; r.append(t)
+        elif tag == 'end':
+            fld = OxmlElement('w:fldChar'); fld.set(qn('w:fldCharType'), 'end'); r.append(fld)
+```
+
+(Mirror the `TOC` field construction already shown elsewhere in this skill for AWX/AAP-style TOC insertion — `REF` fields use the identical `begin`/`separate`/`end` `fldChar` machinery, just with a different field instruction.)
+
+**Known limitation, not a bug to chase:** `REF`/`TOC` fields display their *last-calculated value* until explicitly updated. Real Word updates them automatically on open in normal interactive use (or via F9 / right-click → Update Field); headless conversion pipelines (`soffice --headless --convert-to pdf`, which this skill's own verification workflow uses) generally do **not** run that update pass. Expect an automated verification render of a document using these fields to show a placeholder or stale value rather than the real resolved number — that is a property of the render pipeline, not evidence the underlying field/bookmark is broken. Verify field resolution by opening interactively (Word or LibreOffice Writer's GUI, not the headless PDF export) and confirming an Update Fields pass resolves them correctly.
+
 ### Step 6: Generate Hebrew PPTX with pptxgenjs
 
 ```javascript
@@ -513,6 +654,8 @@ No MCP server applies to this skill. Hebrew document generation runs entirely th
 - Agents may pick fonts that lack Hebrew character support (e.g., Arial works, but many decorative Latin fonts do not). Always verify the font includes the Hebrew Unicode range (U+0590-U+05FF).
 - Hebrew date formatting uses DD/MM/YYYY in secular context and Hebrew calendar dates (e.g., 15 Adar 5786) for religious/traditional documents. Agents may default to MM/DD/YYYY.
 - Legal documents in Israel require specific formatting: nikud (vowel marks) is NOT used in standard business/legal Hebrew. Agents may add nikud thinking it improves clarity, but it actually looks unprofessional in formal documents.
+- python-docx's built-in `'List Bullet'`/`'List Number'` styles are LTR-only (hardcoded `w:lvlJc="left"` + `w:ind w:left=...` in their numbering definition). Do not use them for a Hebrew bulleted/numbered list — build a custom `abstractNum`/`num` with RTL-mirrored indentation instead (see "RTL-correct numbered lists" under Step 5). This is a Word-only bug: LibreOffice and Chromium both auto-mirror the built-in style for display, so it looks fine in every renderer except the one that matters.
+- A short, centered, or otherwise "doesn't look like body text" paragraph (a title-page heading, a TOC label) is just as much a Hebrew paragraph as anything else and still needs `<w:bidi/>` — it is easy to hand-build these with only `WD_ALIGN_PARAGRAPH.CENTER` and skip the helper because they feel like one-off formatting, not "real" RTL content. Route them through `add_rtl_paragraph` like everything else.
 
 ## Troubleshooting
 
@@ -539,3 +682,19 @@ Solution: Set `table.table_direction = WD_TABLE_DIRECTION.RTL` once per table (e
 ### Error: "Hebrew table cells are aligned to the left (headers/text on the left, numbers on the right)"
 Cause: A physical `RIGHT` alignment was set on the cell paragraphs. `w:jc` in OOXML is LOGICAL, not physical: `right` means "line END", and in a Hebrew `<w:bidi/>` paragraph the line ends on the LEFT, so a RIGHT alignment pushes Hebrew to the visual left while LTR number cells still go right, leaving the table ragged and mismatched.
 Solution: Do NOT set any explicit alignment on RTL table cells. Give each cell paragraph `<w:bidi/>` and leave alignment unset, an RTL paragraph defaults to its START edge (the visual right), so headers, Hebrew text, and numbers all line up flush right. See `set_cell_rtl_text` in "Hebrew Tables in DOCX".
+
+### Error: "Hebrew bulleted/numbered list looks right in LibreOffice or a browser, but the bullet/number is on the wrong side in Word, or jumps sides after an editor 'apply RTL' action"
+Cause: The list uses python-docx's built-in `'List Bullet'`/`'List Number'` style, whose numbering definition hardcodes a physical LEFT hanging indent (`w:lvlJc="left"`, `w:ind w:left=...`) with no RTL counterpart. This is a COLUMN/POSITION bug like the reversed-table bug, not a text-direction one — `<w:bidi/>` on the paragraph does not touch the numbering definition's own stored indent. LibreOffice and Chromium both auto-mirror it for *display*, hiding the bug; the stored value only gets exposed by something that respects it as-is (real Word, or an editor action that rewrites the paragraph's actual formatting).
+Solution: Do not use the built-in list styles for Hebrew content. Build a custom `abstractNum`/`num` pair with RTL-mirrored geometry (`w:ind w:right=...`, `w:lvlJc="right"`, `<w:bidi/>` in the level's `pPr`) and reference it via `<w:numPr>` — see "RTL-correct numbered lists" under Step 5. Do not "fix" this by typing a literal `•` character instead of using real numbering — that removes the semantic list entirely (not editable via Word's list tools, invisible to outline view and screen readers).
+
+### Error: "A title-page or TOC-heading paragraph reads in the wrong order once it contains any English, even though it looked fine before"
+Cause: The paragraph was hand-built (`doc.add_paragraph()` + `WD_ALIGN_PARAGRAPH.CENTER`/`RIGHT`) without going through `add_rtl_paragraph`, so it never got `<w:bidi/>`. A short, purely-Hebrew centered line can look correct by luck (alignment alone gives no visible clue the base direction is wrong), but the moment the line is mixed — an English product/section name inside a Hebrew subtitle — Word has no RTL base to bidi-order it against.
+Solution: Route every paragraph, including title pages and TOC headings, through `add_rtl_paragraph` (or replicate its `_para_is_rtl` + `<w:bidi/>` logic) rather than hand-building `pPr` for "just this one" paragraph. See the anti-pattern note at the end of Step 5's four core rules.
+
+### Error: "A reference list / citation list of pure-English lines is right-aligned and RTL-flagged, but it should read as normal left-to-right English"
+Cause: The paragraphs were built with `<w:bidi/>` and `WD_ALIGN_PARAGRAPH.RIGHT` hardcoded unconditionally, instead of going through `add_rtl_paragraph`'s `_para_is_rtl` check. Per rule 1, a pure-English line (no Hebrew characters at all) should get LTR base + left alignment, matching how English-only rows are meant to behave in an otherwise Hebrew document — hardcoding RTL formatting contradicts this for every line in the list.
+Solution: Route these lines through `add_rtl_paragraph` and let `_para_is_rtl` decide the direction per line, rather than assuming an entire section is "RTL because the document is Hebrew." A document being RTL overall does not mean every paragraph in it is.
+
+### Error: "A citation like '(§5.2)' in body text shows the wrong number, or a stale one, after sections were added/reordered"
+Cause: The section number was typed as literal text instead of being backed by real heading auto-numbering + a `REF` field. Typed text never updates when the document changes.
+Solution: Link heading numbering to `Heading1`/`Heading2` via a multilevel numbering definition (RTL-mirrored, same pattern as the bullet fix), bookmark each heading, and cite it with a `REF ... \r \h` field instead of typing the number — see "Cross-reference fields for numbered-section citations" under Step 5. Note that `REF` fields only resolve on an interactive field-update pass (Word on open, or F9); a headless `soffice --convert-to pdf` render will likely show a stale/placeholder value even when the field itself is wired correctly — verify by opening interactively, not from the headless-converted PDF.
