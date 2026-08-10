@@ -158,13 +158,11 @@ def add_rtl_bullet(doc, num_id, text, font='David', size=11, bold_prefix=None):
     numPr.append(ilvl); numPr.append(numIdEl)
     _insert_in_pPr_order(pPr, numPr, 'w:numPr')          # numPr before bidi —
     _insert_in_pPr_order(pPr, OxmlElement('w:bidi'), 'w:bidi')  # required order
-    # Alignment deliberately left UNSET — same reasoning as table cells in
-    # "Hebrew Tables in DOCX": the paragraph's visual position is governed
-    # by the numbering definition's own indent, a separate positioning
-    # subsystem from body-text w:jc. An explicit physical RIGHT is the one
-    # place proven (via the table-cell bug) to fight a subsystem-driven
-    # mirror; leaving it unset lets <w:bidi/> + the numbering's own
-    # right-indent place it correctly.
+    # Alignment deliberately left UNSET, same as every RTL paragraph should
+    # be (see SKILL.md's "Hebrew text ... pushed to the LEFT" Troubleshooting
+    # entry): explicit w:jc="right" is logical-not-physical and renders
+    # flush-left in LibreOffice, for numbered paragraphs same as any other.
+    # <w:bidi/> alone correctly defaults the paragraph to its right edge.
     if bold_prefix:
         _add_runs(p, bold_prefix, font=font, size=size, bold=True)
         _add_runs(p, text, font=font, size=size)
@@ -261,7 +259,10 @@ def add_rtl_paragraph_parts(doc, parts, font='David', size=12, heading_level=Non
     pPr = p._p.get_or_add_pPr()
     if base_rtl:
         pPr.append(pPr.makeelement(qn('w:bidi'), {}))
-    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT if base_rtl else WD_ALIGN_PARAGRAPH.LEFT
+    else:
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    # No explicit RIGHT for the RTL case — see the jc-is-logical
+    # Troubleshooting entry in SKILL.md ("Hebrew text ... pushed to the LEFT").
     for part in parts:
         if isinstance(part, Ref):
             add_ref_field(p, part.bookmark, font=font, size=size)

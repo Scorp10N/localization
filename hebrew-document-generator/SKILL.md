@@ -312,7 +312,11 @@ def add_rtl_paragraph(doc, text, font='David', size=12, bold=False, italic=False
     pPr = p._p.get_or_add_pPr()
     if base_rtl:
         pPr.append(pPr.makeelement(qn('w:bidi'), {}))
-    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT if base_rtl else WD_ALIGN_PARAGRAPH.LEFT
+    else:
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    # No explicit RIGHT for the RTL case — the jc-is-logical trap below
+    # (originally documented for table cells only) applies here too. See
+    # Troubleshooting: "Hebrew text ... pushed to the LEFT".
 
     _add_runs(p, text, font=font, size=size, bold=bold, italic=italic)
     return p
@@ -537,9 +541,9 @@ Solution: Use the `add_rtl_paragraph` helper in Step 5: per-script run splitting
 Cause: This is a COLUMN-ORDER bug, not a text-direction one. python-docx tables ship with no `<w:bidiVisual/>` on `<w:tblPr>`, so Word lays the columns out left-to-right and the first logical column lands on the left, making the whole table read backwards. Fixing the text inside each cell does not move the columns.
 Solution: Set `table.table_direction = WD_TABLE_DIRECTION.RTL` once per table (emits `<w:bidiVisual/>`, which mirrors the visual column order to RTL), AND run each cell's text through the per-cell bidi helper. Both are needed, see "Hebrew Tables in DOCX". Keep your header/row data in natural logical order, do NOT reverse the column list yourself, that double-reverses once `bidiVisual` is set. Verify in Word, not LibreOffice/Preview (they mirror tables more forgivingly and hide this).
 
-### Error: "Hebrew table cells are aligned to the left (headers/text on the left, numbers on the right)"
-Cause: A physical `RIGHT` alignment was set on the cell paragraphs. `w:jc` in OOXML is LOGICAL, not physical: `right` means "line END", and in a Hebrew `<w:bidi/>` paragraph the line ends on the LEFT, so a RIGHT alignment pushes Hebrew to the visual left while LTR number cells still go right, leaving the table ragged and mismatched.
-Solution: Do NOT set any explicit alignment on RTL table cells. Give each cell paragraph `<w:bidi/>` and leave alignment unset, an RTL paragraph defaults to its START edge (the visual right), so headers, Hebrew text, and numbers all line up flush right. See `set_cell_rtl_text` in "Hebrew Tables in DOCX".
+### Error: "Hebrew text — table cells, body paragraphs, or headings — pushed LEFT despite `<w:bidi/>`"
+Cause: Explicit `RIGHT` alignment. `w:jc` is LOGICAL not physical: `right` = "line END", which in a `<w:bidi/>` paragraph is the LEFT. Originally documented for table cells only; PDF-glyph-coordinate verification (not a screenshot) confirmed it hits body paragraphs and `Heading1`/`Heading2` in LibreOffice too.
+Solution: Never set explicit alignment on any RTL paragraph — leave it unset so `<w:bidi/>` defaults it to its START edge (visual right).
 
 ### Error: "Hebrew list bullet is wrong side in Word only, or a '(§5.2)' citation goes stale"
 Cause: Built-in `'List Bullet'` style; a paragraph built outside `add_rtl_paragraph`; or a typed number instead of `REF`.
